@@ -48,7 +48,7 @@ pub trait Environment: 'static + Clone + Debug + Default + Send + Sync {
     const SYNC_NODES: &'static [&'static str] = &["127.0.0.1:4135"];
 
     /// The duration in seconds to sleep in between heartbeat executions.
-    const HEARTBEAT_IN_SECS: u64 = 9;
+    const HEARTBEAT_IN_SECS: u64 = 1;
     /// The maximum duration in seconds permitted for establishing a connection with a node,
     /// before dropping the connection; it should be no greater than the `HEARTBEAT_IN_SECS`.
     const CONNECTION_TIMEOUT_IN_MILLIS: u64 = 500;
@@ -209,6 +209,7 @@ impl<N: Network> Environment for MinerTrial<N> {
     const MINIMUM_NUMBER_OF_PEERS: usize = 11;
     const MAXIMUM_NUMBER_OF_PEERS: usize = 21;
     const COINBASE_IS_PUBLIC: bool = true;
+    const HEARTBEAT_IN_SECS: u64 = 1;
 }
 
 #[derive(Clone, Debug, Default)]

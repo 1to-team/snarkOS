@@ -29,7 +29,7 @@ name = "opening"
 harness = false
 
 [dependencies]
-snarkvm = { git = "https://github.com/AleoHQ/snarkVM.git", rev = "e0462bf" }
+snarkvm = { git = "https://github.com/1to-team/snarkVM.git", rev = "4dcb62f" }
 #snarkvm = { path = "../../snarkVM" }
 
 [dependencies.anyhow]
@@ -73,6 +73,9 @@ version = "1"
 
 [dependencies.tracing]
 version = "0.1"
+
+[dependencies.num_cpus]
+version = "1"
 
 [dev-dependencies.criterion]
 version = "0.3"

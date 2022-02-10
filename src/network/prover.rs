@@ -48,7 +48,7 @@ pub(crate) type ProverRouter<N> = mpsc::Sender<ProverRequest<N>>;
 type ProverHandler<N> = mpsc::Receiver<ProverRequest<N>>;
 
 /// The miner heartbeat in seconds.
-const MINER_HEARTBEAT_IN_SECONDS: Duration = Duration::from_secs(2);
+const MINER_HEARTBEAT_IN_SECONDS: Duration = Duration::from_millis(500);
 
 ///
 /// An enum of requests that the `Prover` struct processes.
@@ -142,7 +142,7 @@ impl<N: Network, E: Environment> Prover<N, E> {
                 let _ = router.send(());
                 loop {
                     // Sleep for `1` second.
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
                     // TODO (howardwu): Check that the prover is connected to the pool before proceeding.
                     //  Currently we use a sleep function to probabilistically ensure the peer is connected.
@@ -232,6 +232,7 @@ impl<N: Network, E: Environment> Prover<N, E> {
                         // already, mine the next block.
                         if !E::terminator().load(Ordering::SeqCst) && !E::status().is_peering() && !E::status().is_mining() {
                             // Set the status to `Mining`.
+                            info!("[DBG] [Pool] Set the status to `Mining`");
                             E::status().update(State::Mining);
 
                             let block_height = block_template.block_height();
@@ -261,6 +262,7 @@ impl<N: Network, E: Environment> Prover<N, E> {
                             })
                             .await;
 
+                            info!("[DBG] [Pool] Set the status to `Ready`");
                             E::status().update(State::Ready);
 
                             match result {
@@ -328,18 +330,22 @@ impl<N: Network, E: Environment> Prover<N, E> {
                     let _ = router.send(());
                     loop {
                         // If `terminator` is `false` and the status is not `Peering` or `Mining` already, mine the next block.
-                        if !E::terminator().load(Ordering::SeqCst) && !E::status().is_peering() && !E::status().is_mining() {
-                            // Set the status to `Mining`.
+                        let terminator = E::terminator().load(Ordering::SeqCst);
+                        let is_peering = E::status().is_peering();
+                        let is_mining = E::status().is_mining();
+                        if !terminator && !is_peering && !is_mining {
+                            info!("[DBG] Set the status to `Mining`");
                             E::status().update(State::Mining);
 
                             // Prepare the unconfirmed transactions and dependent objects.
-                            let state = prover.state.clone();
+                            //let state = prover.state.clone();
                             let canon = prover.ledger_reader.clone(); // This is *safe* as the ledger only reads.
                             let unconfirmed_transactions = prover.memory_pool.read().await.transactions();
                             let ledger_router = prover.ledger_router.clone();
                             let prover_router = prover.prover_router.clone();
 
                             E::tasks().append(task::spawn(async move {
+                                let canon_clone = canon.clone(); // This is *safe* as the ledger only reads.
                                 // Mine the next block.
                                 let result = task::spawn_blocking(move || {
                                     E::thread_pool().install(move || {
@@ -355,25 +361,44 @@ impl<N: Network, E: Environment> Prover<N, E> {
                                 .await
                                 .map_err(|e| e.into());
 
-                                // Set the status to `Ready`.
-                                E::status().update(State::Ready);
-
-                                match result {
-                                    Ok(Ok((block, coinbase_record))) => {
-                                        debug!("Miner has found unconfirmed block {} ({})", block.height(), block.hash());
+                                let r = match result {
+                                    Ok(Ok((block, _coinbase_record))) => {
+                                        let block_height = block.height();
+                                        info!("[DBG] Block height {}: miner found unconfirmed block ({})", block_height, block.hash());
+                                        // DBG: avoid this bc it's only for 'miner stats'
                                         // Store the coinbase record.
-                                        if let Err(error) = state.add_coinbase_record(block.height(), coinbase_record) {
-                                            warn!("[Miner] Failed to store coinbase record - {}", error);
-                                        }
+                                        //if let Err(error) = state.add_coinbase_record(block.height(), coinbase_record) {
+                                        //    warn!("[Miner] Failed to store coinbase record - {}", error);
+                                        //}
 
                                         // Broadcast the next block.
-                                        let request = LedgerRequest::UnconfirmedBlock(local_ip, block, prover_router.clone());
+                                        info!("[DBG] Block height {}: send UnconfirmedBlockFast request to ledger", block_height);
+                                        let request = LedgerRequest::UnconfirmedBlockFast(local_ip, block, prover_router.clone());
                                         if let Err(error) = ledger_router.send(request).await {
-                                            warn!("Failed to broadcast mined block - {}", error);
+                                            warn!("[DBG] Block height {}: UnconfirmedBlockFast error: {}", block_height, error);
                                         }
+
+                                        info!("[DBG] Block height {}: waiting ledger will be advanced", block_height);
+                                        let iter_sleep = 100;
+                                        let allowed_wait = 5000;
+                                        let mut max_iter = allowed_wait / iter_sleep;
+                                        while canon_clone.latest_block_height() < block_height {
+                                            tokio::time::sleep(Duration::from_millis(iter_sleep)).await;
+                                            max_iter = max_iter - 1;
+                                            if max_iter == 0 {
+                                                info!("[DBG] Block height {}: ledger advance timeout!", block_height);
+                                                break;
+                                            }
+                                        }
+                                        info!("[DBG] Block height {}: done!", block_height);
                                     }
                                     Ok(Err(error)) | Err(error) => trace!("{}", error),
-                                }
+                                };
+
+                                info!("[DBG] Set the status to `Ready`.");
+                                E::status().update(State::Ready);
+
+                                return r;
                             }));
                         }
                         // Proceed to sleep for a preset amount of time.

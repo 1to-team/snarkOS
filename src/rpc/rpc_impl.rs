@@ -23,9 +23,12 @@ use crate::{
     rpc::{rpc::*, rpc_trait::RpcFunctions},
     Environment,
     LedgerReader,
+    LedgerRouter,
     Peers,
     ProverRequest,
+    PeersRequest,
     ProverRouter,
+    OperatorRouter,
 };
 use snarkos_storage::Metadata;
 use snarkvm::{
@@ -36,7 +39,7 @@ use snarkvm::{
 use jsonrpc_core::Value;
 use snarkvm::{dpc::Record, utilities::ToBytes};
 use std::{cmp::max, net::SocketAddr, ops::Deref, sync::Arc, time::Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot,RwLock};
 
 #[derive(Debug, Error)]
 pub enum RpcError {
@@ -67,6 +70,7 @@ pub struct RpcInner<N: Network, E: Environment> {
     address: Option<Address<N>>,
     peers: Arc<Peers<N, E>>,
     ledger: LedgerReader<N>,
+    ledger_router: LedgerRouter<N>,
     operator: Arc<Operator<N, E>>,
     prover_router: ProverRouter<N>,
     memory_pool: Arc<RwLock<MemoryPool<N>>>,
@@ -95,6 +99,7 @@ impl<N: Network, E: Environment> RpcImpl<N, E> {
         address: Option<Address<N>>,
         peers: Arc<Peers<N, E>>,
         ledger: LedgerReader<N>,
+        ledger_router: LedgerRouter<N>,
         operator: Arc<Operator<N, E>>,
         prover_router: ProverRouter<N>,
         memory_pool: Arc<RwLock<MemoryPool<N>>>,
@@ -103,6 +108,7 @@ impl<N: Network, E: Environment> RpcImpl<N, E> {
             address,
             peers,
             ledger,
+            ledger_router,
             operator,
             prover_router,
             memory_pool,
@@ -340,6 +346,37 @@ impl<N: Network, E: Environment> RpcFunctions<N> for RpcImpl<N, E> {
             warn!("[UnconfirmedTransaction] {}", error);
         }
         Ok(transaction.transaction_id())
+    }
+
+    async fn connect_peer(&self, peer_ip: String) -> Result<String, RpcError> {
+        //let ip = peer_ip.parse().unwrap();
+
+        // Initialize the connection process.
+        //let (router, handler) = oneshot::channel();
+
+        // Route a `Connect` request to the peer manager.
+        //let _r = self.peers
+        //    .router()
+        //    .send(PeersRequest::Connect(
+        //        ip,
+        //        self.ledger.clone(),
+        //        self.ledger_router.clone(),
+        //        self.operator_router.clone(),
+        //        self.prover_router.clone(),
+        //        router,
+        //    ))
+        //    .await;
+
+        // Wait until the connection task is initialized.
+        //let _r2 = handler.await;
+
+        Ok("Ok".to_string())
+        //handler.await.map(|_| ()).map_err(|e| e.into())
+    }
+
+    async fn set_coinbase_path(&self, coinbase_path: String) -> Result<String, RpcError> {
+        self.ledger.set_coinbase_path(coinbase_path)?;
+        Ok("Ok".to_string())
     }
 
     /// Returns the amount of shares submitted by a given prover.

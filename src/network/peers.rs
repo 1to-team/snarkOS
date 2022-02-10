@@ -561,7 +561,7 @@ impl<N: Network, E: Environment> Peers<N, E> {
                     self.connected_peers.write().await.remove(&peer);
                 }
             }
-            None => warn!("Attempted to send to a non-connected peer {}", peer),
+            None => warn!("Attempted to send {} to a non-connected peer {}", message.name(), peer),
         }
     }
 
@@ -570,7 +570,8 @@ impl<N: Network, E: Environment> Peers<N, E> {
     ///
     async fn propagate(&self, sender: SocketAddr, mut message: Message<N, E>) {
         // Perform ahead-of-time, non-blocking serialization just once for applicable objects.
-        if let Message::UnconfirmedBlock(_, _, ref mut data) = message {
+        if let Message::UnconfirmedBlock(block_height, _, ref mut data) = message {
+            info!("[DBG] Block height {}: propagating unconfirmed block to peers", block_height);
             let serialized_block = Data::serialize(data.clone()).await.expect("Block serialization is bugged");
             let _ = std::mem::replace(data, Data::Buffer(serialized_block));
         }

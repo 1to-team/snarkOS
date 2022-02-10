@@ -20,15 +20,18 @@ use crate::{
     network::Server,
     Display,
 };
+use rand::thread_rng;
 use snarkos_storage::storage::rocksdb::RocksDB;
 use snarkvm::dpc::{prelude::*, testnet2::Testnet2};
 
 use anyhow::{anyhow, Result};
 use colored::*;
 use crossterm::tty::IsTty;
-use std::{io, net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{io::{self, Write}, process, thread, net::SocketAddr, path::PathBuf, str::FromStr, fs::OpenOptions, time::{Instant, Duration}, sync::atomic::AtomicBool};
+use std::sync::Arc;
 use structopt::StructOpt;
 use tokio::{signal, sync::mpsc, task};
+use rayon::ThreadPoolBuilder;
 use tracing_subscriber::EnvFilter;
 
 #[derive(StructOpt, Debug)]
@@ -114,6 +117,7 @@ impl Node {
             match (self.network, &self.miner, &self.operator, &self.prover, self.sync) {
                 (2, None, None, None, false) => NodeType::Client,
                 (2, Some(_), None, None, false) => NodeType::Miner,
+                (2, Some(_), None, None, true) => NodeType::Miner,
                 (2, None, Some(_), None, false) => NodeType::Operator,
                 (2, None, None, Some(_), false) => NodeType::Prover,
                 (2, None, None, None, true) => NodeType::Sync,
@@ -240,6 +244,10 @@ pub enum Command {
     Experimental(Experimental),
     #[structopt(name = "miner", about = "Miner commands and settings")]
     Miner(MinerSubcommand),
+    #[structopt(name = "mineblock", about = "Mine block command")]
+    MineBlock(MineBlock),
+    #[structopt(name = "gencoinbase", about = "Generate coinbase in advance")]
+    GenCoinbase(GenCoinbase),
 }
 
 impl Command {
@@ -249,6 +257,8 @@ impl Command {
             Self::Update(command) => command.parse(),
             Self::Experimental(command) => command.parse(),
             Self::Miner(command) => command.parse(),
+            Self::MineBlock(command) => command.parse(),
+            Self::GenCoinbase(command) => command.parse(),
         }
     }
 }
@@ -480,6 +490,129 @@ impl MinerStats {
         ));
     }
 }
+
+#[derive(StructOpt, Debug)]
+pub struct MineBlock {
+    #[structopt()]
+    block_template: String,
+    #[structopt(long = "pool-size", default_value = "8")]
+    pool_size: usize,
+    #[structopt(long = "start-delay", default_value = "0")]
+    start_delay: u64,
+}
+
+impl MineBlock {
+    pub fn parse(self) -> Result<String> {
+        // Run mine block
+        Self::mine_block(self.block_template, self.pool_size, self.start_delay)
+    }
+
+    fn mine_block(block_template_str: String, pool_size: usize, start_delay: u64) -> Result<String> {
+        let mut block_template = BlockTemplate::from_str(&block_template_str).unwrap();
+
+        info!("[{}] Mine block (height = {}, difficulty target = {}, thread pool size = {}", process::id(), block_template.block_height(), block_template.difficulty_target(), pool_size);
+
+        if start_delay != 0 {
+            info!("[{}] Delay for {} ms", process::id(), start_delay);
+            thread::sleep(Duration::from_millis(start_delay));
+        }
+
+        let start = Instant::now();
+        let terminator = AtomicBool::new(false);
+        info!("[{}] Mine start", process::id());
+
+        let thread_pool = Arc::new(ThreadPoolBuilder::new()
+                                    .stack_size(8 * 1024 * 1024)
+                                    .num_threads(pool_size)
+                                    .build().unwrap());
+
+        let mut iteration = 0;
+        let block_header = thread_pool.install(move || {
+            Testnet2::posw().mine2(&mut block_template, &terminator, &mut thread_rng(), &mut iteration).unwrap()
+        });
+
+        info!("[{}] Mine end: {:.2} s", process::id(), (start.elapsed().as_micros() as f64) / 1000.0 / 1000.0);
+
+        // Ensure the block header now is valid.
+        match block_header.is_valid() {
+            true => Ok(block_header.to_string()),
+            false => Err(anyhow!("Failed to initialize a block header")),
+        }
+    }
+}
+
+
+#[derive(StructOpt, Debug)]
+pub struct GenCoinbase {
+    #[structopt(multiple=true, long = "addresses")]
+    addresses: Vec<String>,
+    #[structopt()]
+    start_height: u32,
+    #[structopt()]
+    end_height: u32,
+    #[structopt(default_value = "/tmp", long = "store-path")]
+    store_path: String,
+}
+
+impl GenCoinbase {
+    pub fn parse(self) -> Result<String> {
+        Self::gen_coinbase(self.addresses, self.start_height, self.end_height, self.store_path)
+    }
+
+    fn gen_coinbase(addresses: Vec<String>, start_height: u32, end_height: u32, store_path: String) -> Result<String> {
+        let rng = &mut thread_rng();
+        let transaction_fees = AleoAmount::ZERO;
+        let mut height = start_height;
+        info!("Generate coinbases start_height = {}; end_height = {}; addresses = {:?}; store_path = {}", start_height, end_height, addresses, store_path);
+        while height < end_height {
+            for address_str in &addresses {
+                let start = Instant::now();
+                let mut coinbase_reward = Block::<Testnet2>::block_reward(height);
+                coinbase_reward = coinbase_reward.add(transaction_fees);
+
+                info!("[DBG] [gen_coinbase] start (height = {}; reward = {}; address = {}", height, coinbase_reward, address_str);
+
+                let address = Address::<Testnet2>::from_str(&address_str).expect("Unable to read miner addrress");
+                let (coinbase_transaction, coinbase_record) = Transaction::<Testnet2>::new_coinbase(address, coinbase_reward, true, rng).unwrap();
+
+                let s_coinbase_transaction = serde_json::to_string(&coinbase_transaction).unwrap();
+                let s_coinbase_record = serde_json::to_string(&coinbase_record).unwrap();
+
+                let fn_coinbase_transaction = format!("{}/coinbase_transaction_{}.json", store_path, height);
+                let fn_coinbase_record = format!("{}/coinbase_record_{}.json", store_path, height);
+
+                // Write coinbase tx to file
+                let mut f_coinbase_transaction = OpenOptions::new()
+                    .read(false)
+                    .write(true)
+                    .append(false)
+                    .create(true)
+                    .open(&fn_coinbase_transaction)
+                    .expect("Unable to open for writing");
+
+                let mut f_coinbase_record = OpenOptions::new()
+                    .read(false)
+                    .write(true)
+                    .append(false)
+                    .create(true)
+                    .open(&fn_coinbase_record)
+                    .expect("Unable to open for writing");
+
+                f_coinbase_transaction.write_all(s_coinbase_transaction.as_bytes()).expect("Unable to write data");
+                f_coinbase_record.write_all(s_coinbase_record.as_bytes()).expect("Unable to write data");
+
+                drop(f_coinbase_transaction);
+                drop(f_coinbase_record);
+
+                info!("[DBG] [gen_coinbase] end: {:.2} s", (start.elapsed().as_micros() as f64) / 1000.0 / 1000.0);
+                height+=1;
+            }
+        }
+
+        return Ok("end".to_string());
+    }
+}
+
 
 // This function is responsible for handling OS signals in order for the node to be able to intercept them
 // and perform a clean shutdown.

@@ -68,6 +68,8 @@ pub enum LedgerRequest<N: Network> {
     Pong(SocketAddr, NodeType, State, Option<bool>, BlockLocators<N>),
     /// UnconfirmedBlock := (peer_ip, block, prover_router)
     UnconfirmedBlock(SocketAddr, Block<N>, ProverRouter<N>),
+    /// UnconfirmedBlockFast := (peer_ip, block, prover_router)
+    UnconfirmedBlockFast(SocketAddr, Block<N>, ProverRouter<N>),
 }
 
 pub type PeersState<N> = HashMap<SocketAddr, Option<(NodeType, State, Option<bool>, u32, BlockLocators<N>)>>;
@@ -194,6 +196,8 @@ impl<N: Network, E: Environment> Ledger<N, E> {
     /// All requests must go through this `update`, so that a unified view is preserved.
     ///
     pub(super) async fn update(&self, request: LedgerRequest<N>) {
+        // too verbose info!("[ledger] New request: {:?}", request);
+
         match request {
             LedgerRequest::BlockResponse(peer_ip, block, prover_router) => {
                 // Remove the block request from the ledger.
@@ -223,16 +227,22 @@ impl<N: Network, E: Environment> Ledger<N, E> {
             LedgerRequest::Heartbeat(prover_router) => {
                 // Update for sync nodes.
                 self.update_sync_nodes().await;
+                
                 // Update the ledger.
                 self.update_ledger(&prover_router).await;
+                
                 // Update the status of the ledger.
                 self.update_status().await;
+                
                 // Remove expired block requests.
                 self.remove_expired_block_requests().await;
+                
                 // Remove expired failures.
                 self.remove_expired_failures().await;
+                
                 // Disconnect from peers with frequent failures.
                 self.disconnect_from_failing_peers().await;
+               
                 // Update the block requests.
                 self.update_block_requests().await;
 
@@ -240,13 +250,15 @@ impl<N: Network, E: Environment> Ledger<N, E> {
                 let connected_peers = self.peers_state.read().await.len();
 
                 debug!(
-                    "Status Report (type = {}, status = {}, block_height = {}, cumulative_weight = {}, block_requests = {}, connected_peers = {})",
+                    "Status Report (type = {}, status = {}, block_height = {}, cumulative_weight = {}, block_requests = {}, connected_peers = {} (min = {}; max = {}))",
                     E::NODE_TYPE,
                     E::status(),
                     self.canon.latest_block_height(),
                     self.canon.latest_cumulative_weight(),
                     block_requests,
                     connected_peers,
+                    E::MINIMUM_NUMBER_OF_PEERS,
+                    E::MAXIMUM_NUMBER_OF_PEERS
                 );
             }
             LedgerRequest::Pong(peer_ip, node_type, status, is_fork, block_locators) => {
@@ -256,17 +268,39 @@ impl<N: Network, E: Environment> Ledger<N, E> {
                 self.update_peer(peer_ip, node_type, status, is_fork, block_locators).await;
             }
             LedgerRequest::UnconfirmedBlock(peer_ip, block, prover_router) => {
+                //let block_height = block.height();
                 // Ensure the node is not peering.
                 if !E::status().is_peering() {
                     // Process the unconfirmed block.
+                    //info!("[DBG] Block height {}: adding unconfirmed block to ledger", block_height);
                     self.add_block(block.clone(), &prover_router).await;
                     // Propagate the unconfirmed block to the connected peers.
                     let message = Message::UnconfirmedBlock(block.height(), block.hash(), Data::Object(block));
                     let request = PeersRequest::MessagePropagate(peer_ip, message);
+                    //info!("[DBG] Block height {}: broadcasting unconfirmed block to peers", block_height);
                     if let Err(error) = self.peers_router.send(request).await {
                         warn!("[UnconfirmedBlock] {}", error);
                     }
                 }
+            }
+            LedgerRequest::UnconfirmedBlockFast(peer_ip, block, prover_router) => {
+                let block_height = block.height();
+
+                info!("[DBG] Block height {}: UnconfirmedBlockFast start", block_height);
+
+                // Propagate the unconfirmed block to the connected peers.
+                let message = Message::UnconfirmedBlock(block_height, block.hash(), Data::Object(block.clone()));
+                let request = PeersRequest::MessagePropagate(peer_ip, message);
+                info!("[DBG] Block height {}: broadcasting unconfirmed block to peers", block_height);
+                if let Err(error) = self.peers_router.send(request).await {
+                    warn!("[UnconfirmedBlockFast] {}", error);
+                }
+
+                // Process the unconfirmed block.
+                info!("[DBG] Block height {}: adding unconfirmed block to ledger", block_height);
+                self.add_block(block, &prover_router).await;
+
+                info!("[DBG] Block height {}: UnconfirmedBlockFast end", block_height);
             }
         }
     }
@@ -418,7 +452,13 @@ impl<N: Network, E: Environment> Ledger<N, E> {
         }
         // If there is an insufficient number of connected peers, set the status to `Peering`.
         else if self.peers_state.read().await.len() < E::MINIMUM_NUMBER_OF_PEERS {
+            //if status != State::Mining {
+            info!("[DBG] [update_status] Update the status to `Peering`.");
             status = State::Peering;
+            //}
+            //else {
+            //    info!("[DBG] [update_status] Low peers count now but we in `Mining` right now");
+            //}
         }
         // If the ledger is out of date, set the status to `Syncing`.
         else {
@@ -450,11 +490,15 @@ impl<N: Network, E: Environment> Ledger<N, E> {
 
         // If the node is `Peering` or `Syncing`, it should not be mining.
         if status == State::Peering || status == State::Syncing {
+            info!("[DBG] [update_status] Set the terminator bit to `true` to ensure it does not mine.");
             // Set the terminator bit to `true` to ensure it does not mine.
             E::terminator().store(true, Ordering::SeqCst);
         } else {
-            // Set the terminator bit to `false` to ensure it is allowed to mine.
-            E::terminator().store(false, Ordering::SeqCst);
+            if status != State::Mining {
+                info!("[DBG] [update_status] Set the terminator bit to `false` to ensure it is allowed to mine.");
+                // Set the terminator bit to `false` to ensure it is allowed to mine.
+                E::terminator().store(false, Ordering::SeqCst);
+            }
         }
 
         // Update the ledger to the determined status.
@@ -486,6 +530,11 @@ impl<N: Network, E: Environment> Ledger<N, E> {
         } else if unconfirmed_block_height == self.canon.latest_block_height() + 1
             && unconfirmed_previous_block_hash == self.canon.latest_block_hash()
         {
+            //if !self.terminator.load(Ordering::SeqCst) && self.status.is_mining() {
+            //    info!("[DBG] new block arrived {} ({}). But we are in mining right now, so delay it for 3 seconds!", unconfirmed_block_height, unconfirmed_block_hash);
+            //    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            //}
+            
             // Acquire the lock for block requests.
             let _block_requests_lock = self.block_requests_lock.lock().await;
             // Acquire the lock for the canon chain.
@@ -523,6 +572,7 @@ impl<N: Network, E: Environment> Ledger<N, E> {
                         // Update the timestamp of the last block increment.
                         *self.last_block_update_timestamp.write().await = Instant::now();
                         // Set the terminator bit to `true` to ensure the miner updates state.
+                        info!("[DBG] [terminate mining] new block arrived {} ({})", self.canon.latest_block_height(), self.canon.latest_block_hash());
                         E::terminator().store(true, Ordering::SeqCst);
                         // On success, filter the unconfirmed blocks of this block, if it exists.
                         self.unconfirmed_blocks.write().await.remove(&unconfirmed_previous_block_hash);
@@ -571,6 +621,7 @@ impl<N: Network, E: Environment> Ledger<N, E> {
                 // Update the last block update timestamp.
                 *self.last_block_update_timestamp.write().await = Instant::now();
                 // Set the terminator bit to `true` to ensure the miner resets state.
+                info!("[DBG] [terminate mining] ledger reverted");
                 E::terminator().store(true, Ordering::SeqCst);
 
                 // Lock unconfirmed_blocks for further processing.
@@ -586,6 +637,7 @@ impl<N: Network, E: Environment> Ledger<N, E> {
                 warn!("{}", error);
 
                 // Set the terminator bit to `true` to ensure the miner resets state.
+                info!("[DBG] [terminate mining] ledger revert error");
                 E::terminator().store(true, Ordering::SeqCst);
                 // Reset the unconfirmed blocks.
                 self.unconfirmed_blocks.write().await.clear();

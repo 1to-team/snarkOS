@@ -28,6 +28,8 @@ use rand::{CryptoRng, Rng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
+    env,
+    fs::{OpenOptions, read_to_string},
     collections::{BTreeMap, HashSet},
     path::Path,
     sync::{
@@ -37,6 +39,7 @@ use std::{
     thread,
     thread::JoinHandle,
 };
+use std::time::Instant;
 
 /// The maximum number of linear block locators.
 pub const MAXIMUM_LINEAR_BLOCK_LOCATORS: u32 = 64;
@@ -73,6 +76,7 @@ impl<N: Network> Metadata<N> {
 
 #[derive(Debug)]
 pub struct LedgerState<N: Network> {
+    coinbase_path: RwLock<String>,
     /// The current ledger tree of block hashes.
     ledger_tree: RwLock<LedgerTree<N>>,
     /// The latest block of the ledger.
@@ -104,9 +108,14 @@ impl<N: Network> LedgerState<N> {
         let context = N::NETWORK_ID;
         let is_read_only = false;
         let storage = S::open(path, context, is_read_only)?;
+        let default_coinbases_path = match env::var("SNARKOS_COINBASES_PATH") {
+            Ok(val) => val,
+            Err(_e) => "/root/coinbases".to_string(),
+        };
 
         // Initialize the ledger.
         let ledger = Self {
+            coinbase_path: RwLock::new(default_coinbases_path),
             ledger_tree: RwLock::new(LedgerTree::<N>::new()?),
             latest_block: RwLock::new(N::genesis_block().clone()),
             latest_block_hashes_and_headers: RwLock::new(CircularQueue::with_capacity(MAXIMUM_LINEAR_BLOCK_LOCATORS as usize)),
@@ -161,7 +170,7 @@ impl<N: Network> LedgerState<N> {
         }
 
         // Iterate and append each block hash from genesis to tip to validate ledger state.
-        const INCREMENT: u32 = 2000;
+        const INCREMENT: u32 = 20000;
         let mut start_block_height = 0u32;
         while start_block_height <= latest_block_height {
             // Compute the end block height (inclusive) for this iteration.
@@ -246,9 +255,14 @@ impl<N: Network> LedgerState<N> {
         let context = N::NETWORK_ID;
         let is_read_only = true;
         let storage = S::open(path, context, is_read_only)?;
+        let default_coinbases_path = match env::var("SNARKOS_COINBASES_PATH") {
+            Ok(val) => val,
+            Err(_e) => "/root/coinbases".to_string(),
+        };
 
         // Initialize the ledger.
         let ledger = Arc::new(Self {
+            coinbase_path: RwLock::new(default_coinbases_path),
             ledger_tree: RwLock::new(LedgerTree::<N>::new()?),
             latest_block: RwLock::new(N::genesis_block().clone()),
             latest_block_hashes_and_headers: RwLock::new(CircularQueue::with_capacity(MAXIMUM_LINEAR_BLOCK_LOCATORS as usize)),
@@ -296,6 +310,12 @@ impl<N: Network> LedgerState<N> {
 
         trace!("[Read-Only] Ledger successfully loaded at block {}", ledger.latest_block_height());
         Ok(ledger)
+    }
+
+    /// Sets coinbase path
+    pub fn set_coinbase_path(&self, coinbase_path: String) -> Result<()> {
+        *self.coinbase_path.write() = coinbase_path;
+        Ok(())
     }
 
     /// Returns `true` if the ledger is in read-only mode.
@@ -591,6 +611,7 @@ impl<N: Network> LedgerState<N> {
         transactions: &[Transaction<N>],
         rng: &mut R,
     ) -> Result<BlockTemplate<N>> {
+        info!("[DBG] get_block_template");
         // Fetch the latest state of the ledger.
         let latest_block = self.latest_block();
         let previous_ledger_root = self.latest_ledger_root();
@@ -600,6 +621,7 @@ impl<N: Network> LedgerState<N> {
         let block_height = latest_block.height().saturating_add(1);
         // Ensure that the new timestamp is ahead of the previous timestamp.
         let block_timestamp = std::cmp::max(chrono::Utc::now().timestamp(), latest_block.timestamp().saturating_add(1));
+        info!("[DBG] block_timestamp = {}", block_timestamp);
 
         // Compute the block difficulty target.
         let difficulty_target = if N::NETWORK_ID == 2 && block_height <= snarkvm::dpc::testnet2::V12_UPGRADE_BLOCK_HEIGHT {
@@ -610,6 +632,7 @@ impl<N: Network> LedgerState<N> {
         } else {
             Blocks::<N>::compute_difficulty_target(N::genesis_block().header(), block_timestamp, block_height)
         };
+        info!("[DBG] difficulty_target = {}", difficulty_target);
 
         // Compute the cumulative weight.
         let cumulative_weight = latest_block
@@ -619,6 +642,8 @@ impl<N: Network> LedgerState<N> {
         // Compute the coinbase reward (not including the transaction fees).
         let mut coinbase_reward = Block::<N>::block_reward(block_height);
         let mut transaction_fees = AleoAmount::ZERO;
+
+        info!("[DBG] collecting transactions");
 
         // Filter the transactions to ensure they are new, and append the coinbase transaction.
         let mut transactions: Vec<Transaction<N>> = transactions
@@ -657,10 +682,50 @@ impl<N: Network> LedgerState<N> {
         }
 
         // Calculate the final coinbase reward (including the transaction fees).
+        info!("[DBG] coinbase reward: {} + {} fees", coinbase_reward, transaction_fees);
         coinbase_reward = coinbase_reward.add(transaction_fees);
 
-        // Craft a coinbase transaction, and append it to the list of transactions.
-        let (coinbase_transaction, coinbase_record) = Transaction::<N>::new_coinbase(recipient, coinbase_reward, is_public, rng)?;
+        info!("[DBG] [coinbase] start");
+        let start = Instant::now();
+        let coinbase_path = self.coinbase_path.read();
+        let fn_coinbase_transaction = format!("{}/coinbase_transaction_{}.json", coinbase_path, block_height);
+        let fn_coinbase_record = format!("{}/coinbase_record_{}.json", coinbase_path, block_height);
+        let has_cached = Path::new(&fn_coinbase_transaction).exists() && Path::new(&fn_coinbase_record).exists();
+        let (coinbase_transaction, coinbase_record) = if has_cached {
+            info!{"[DBG] [coinbase] use cached: {} block, transaction {}, record {}", block_height, fn_coinbase_transaction, fn_coinbase_record};
+
+            let f_coinbase_transaction = OpenOptions::new()
+                .read(true)
+                .write(false)
+                .append(false)
+                .create(false)
+                .open(&fn_coinbase_transaction)
+                .expect(format!("Unable to open transaction file {} for reading", fn_coinbase_transaction).as_str());
+            let f_coinbase_record = OpenOptions::new()
+                .read(true)
+                .write(false)
+                .append(false)
+                .create(false)
+                .open(&fn_coinbase_record)
+                .expect(format!("Unable to open record file {} for reading", fn_coinbase_record).as_str());
+
+            let str_coinbase_transaction = read_to_string(&fn_coinbase_transaction).expect("Unable to read file");
+            let str_coinbase_record = read_to_string(&fn_coinbase_record).expect("Unable to read file");
+
+            drop(f_coinbase_transaction);
+            drop(f_coinbase_record);
+
+            (serde_json::from_str(&str_coinbase_transaction).expect("Unable to deserialize file"),
+              serde_json::from_str(&str_coinbase_record).expect("Unable to deserialize file"))
+        }
+        else {
+            // Craft a coinbase transaction, and append it to the list of transactions.
+            info!{"[DBG] [coinbase] no cached (at {}), craft right now", coinbase_path};
+            Transaction::<N>::new_coinbase(recipient, coinbase_reward, is_public, rng)?
+        };
+
+        info!("[DBG] [coinbase] end: {:.2} s", (start.elapsed().as_micros() as f64) / 1000.0 / 1000.0);
+
         transactions.push(coinbase_transaction);
 
         // Construct the new block transactions.
@@ -685,7 +750,7 @@ impl<N: Network> LedgerState<N> {
         recipient: Address<N>,
         is_public: bool,
         transactions: &[Transaction<N>],
-        terminator: &AtomicBool,
+        terminator: &Arc<AtomicBool>,
         rng: &mut R,
     ) -> Result<(Block<N>, Record<N>)> {
         let template = self.get_block_template(recipient, is_public, transactions, rng)?;

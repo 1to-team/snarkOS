@@ -79,6 +79,8 @@ pub(crate) struct Peer<N: Network, E: Environment> {
     seen_outbound_blocks: HashMap<N::BlockHash, SystemTime>,
     /// The map of peers to a map of transaction IDs to their last seen timestamp.
     seen_outbound_transactions: HashMap<N::TransactionID, SystemTime>,
+    // Track the peers to which we sent unconfirmed blocks lastly
+    last_unconfirmed_block_sent: HashMap<SocketAddr, (u32, SystemTime)>,
 }
 
 impl<N: Network, E: Environment> Peer<N, E> {
@@ -137,6 +139,7 @@ impl<N: Network, E: Environment> Peer<N, E> {
             seen_inbound_transactions: Default::default(),
             seen_outbound_blocks: Default::default(),
             seen_outbound_transactions: Default::default(),
+            last_unconfirmed_block_sent: Default::default(),
         })
     }
 
@@ -147,6 +150,27 @@ impl<N: Network, E: Environment> Peer<N, E> {
 
     /// Sends the given message to this peer.
     async fn send(&mut self, message: Message<N, E>) -> Result<()> {
+        // we send them too fast, we get disconnected for spamming
+        if message.name() == "UnconfirmedBlock" {
+            let peer_ip = self.peer_ip().clone();
+            let (_count, _last_seen) = self.last_unconfirmed_block_sent.entry(peer_ip).or_insert((0, SystemTime::now()));
+            let count = _count.clone();
+            let last_seen = _last_seen.clone();
+            let elapsed = _last_seen.elapsed().unwrap_or(Duration::MAX).as_millis();
+            if *_count >= 4 && elapsed < 5000 {
+                let sleep = (5000u128 - elapsed) as u64;
+                info!("...send is going to sleep {} ms to prevent spamming the peer {} count {} elapsed {}", sleep, peer_ip, *_count, elapsed );
+                tokio::time::sleep(Duration::from_millis(sleep)).await;
+                self.last_unconfirmed_block_sent.insert(peer_ip, (1, SystemTime::now()));
+            } else if *_count > 0 && elapsed as f64 / *_count as f64 > 1000.0 {
+                trace!("...send didn't sleep to prevent spamming the peer {} count {} elapsed {}, resetting tracker", peer_ip, *_count, elapsed );
+                self.last_unconfirmed_block_sent.insert(peer_ip, (1, SystemTime::now()));				
+            } else {
+                trace!("...send didn't sleep to prevent spamming the peer {} count {} elapsed {}", peer_ip, *_count, elapsed );
+                self.last_unconfirmed_block_sent.insert(peer_ip, (count + 1, last_seen));
+            }
+        }
+
         trace!("Sending '{}' to {}", message.name(), self.peer_ip());
         self.outbound_socket.send(message).await?;
         Ok(())
@@ -207,13 +231,27 @@ impl<N: Network, E: Environment> Peer<N, E> {
                                 fork_depth
                             ));
                         }
+                        trace!("...handshake: Check if {} is ahead {} vs mine {}", peer_ip, peer_cumulative_weight, local_cumulative_weight);
+                        if E::NODE_TYPE != NodeType::Sync
+                            && node_type != NodeType::Sync
+                            && local_cumulative_weight > peer_cumulative_weight
+                        {
+                            info!("...handshake: Dropping {} as my node is ahead", peer_ip);
+                            return Err(anyhow!("Dropping {} as my node is ahead", peer_ip));
+                        } else {
+                            let diff: i128 = (peer_cumulative_weight - local_cumulative_weight) as i128;
+                            info!("...handshake: Keeping {} as my node is behind, diff {}", peer_ip, diff);
+                        }
                         // If this node is not a sync node and is syncing, the peer is a sync node, and this node is ahead, proceed to disconnect.
                         if E::NODE_TYPE != NodeType::Sync
                             && E::status().is_syncing()
                             && node_type == NodeType::Sync
                             && local_cumulative_weight > peer_cumulative_weight
                         {
-                            return Err(anyhow!("Dropping {} as this node is ahead", peer_ip));
+                            return Err(anyhow!("Dropping sync {} as my node is ahead", peer_ip));
+                        } else {
+                            let diff: i128 = (peer_cumulative_weight - local_cumulative_weight) as i128;
+                            info!("...handshake: Keeping sync {} as my node is behind, diff {}", peer_ip, diff);
                         }
                         // If this node is a sync node, the peer is not a sync node and is syncing, and the peer is ahead, proceed to disconnect.
                         if E::NODE_TYPE == NodeType::Sync
@@ -614,9 +652,9 @@ impl<N: Network, E: Environment> Peer<N, E> {
                                     }));
                                 }
                                 Message::UnconfirmedBlock(block_height, block_hash, block) => {
-                                    // Drop the peer, if they have sent more than 5 unconfirmed blocks in the last 5 seconds.
+                                    // Drop the peer, if they have sent more than 50 unconfirmed blocks in the last 5 seconds.
                                     let frequency = peer.seen_inbound_blocks.values().filter(|t| t.elapsed().unwrap().as_secs() <= 5).count();
-                                    if frequency >= 10 {
+                                    if frequency >= 50 {
                                         warn!("Dropping {} for spamming unconfirmed blocks (frequency = {})", peer_ip, frequency);
                                         // Send a `PeerRestricted` message.
                                         if let Err(error) = peers_router.send(PeersRequest::PeerRestricted(peer_ip)).await {
@@ -717,23 +755,33 @@ impl<N: Network, E: Environment> Peer<N, E> {
                                 Message::PoolRequest(share_difficulty, block_template) => {
                                     if E::NODE_TYPE != NodeType::Prover {
                                         trace!("Skipping 'PoolRequest' from {}", peer_ip);
-                                    } else if let Ok(block_template) = block_template.deserialize().await {
-                                        if let Err(error) = prover_router.send(ProverRequest::PoolRequest(peer_ip, share_difficulty, block_template)).await {
-                                            warn!("[PoolRequest] {}", error);
-                                        }
                                     } else {
-                                        warn!("[PoolRequest] could not deserialize block template");
+                                        match block_template.deserialize().await {
+                                            Ok(block_template) => {
+                                                if let Err(error) = prover_router.send(ProverRequest::PoolRequest(peer_ip, share_difficulty, block_template)).await {
+                                                    warn!("[PoolRequest] {}", error);
+                                                }
+                                            }
+                                            Err(error) => {
+                                                warn!("[PoolRequest] could not deserialize block template from {}: {}", peer_ip, error);
+                                            }
+                                        }
                                     }
                                 }
                                 Message::PoolResponse(address, nonce, proof) => {
                                     if E::NODE_TYPE != NodeType::Operator {
                                         trace!("Skipping 'PoolResponse' from {}", peer_ip);
-                                    } else if let Ok(proof) = proof.deserialize().await {
-                                        if let Err(error) = operator_router.send(OperatorRequest::PoolResponse(peer_ip, address, nonce, proof)).await {
-                                            warn!("[PoolResponse] {}", error);
-                                        }
                                     } else {
-                                        warn!("[PoolResponse] could not deserialize proof");
+                                        match proof.deserialize().await {
+                                            Ok(proof) => {
+                                                if let Err(error) = operator_router.send(OperatorRequest::PoolResponse(peer_ip, address, nonce, proof)).await {
+                                                    warn!("[PoolResponse] {}", error);
+                                                }
+                                            }
+                                            Err(error) => {
+                                                warn!("[PoolResponse] could not deserialize proof from {}: {}", peer_ip, error);
+                                            }
+                                        }
                                     }
                                 }
                                 Message::Unused(_) => break, // Peer is not following the protocol.

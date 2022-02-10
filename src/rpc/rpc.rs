@@ -21,7 +21,9 @@ use crate::{
     rpc::{rpc_impl::RpcImpl, rpc_trait::RpcFunctions},
     Environment,
     LedgerReader,
+    LedgerRouter,
     Peers,
+    OperatorRouter,
     ProverRouter,
 };
 use snarkvm::dpc::{Address, MemoryPool, Network};
@@ -55,7 +57,7 @@ pub struct Meta {
 
 impl Metadata for Meta {}
 
-const METHODS_EXPECTING_PARAMS: [&str; 13] = [
+const METHODS_EXPECTING_PARAMS: [&str; 15] = [
     // public
     "getblock",
     "getblocks",
@@ -69,6 +71,8 @@ const METHODS_EXPECTING_PARAMS: [&str; 13] = [
     "gettransaction",
     "gettransition",
     "sendtransaction",
+    "password_connectpeer",
+    "password_setcoinbasepath",
     "getsharesforprover",
     // // private
     // "createtransaction",
@@ -87,12 +91,13 @@ pub async fn initialize_rpc_server<N: Network, E: Environment>(
     address: Option<Address<N>>,
     peers: &Arc<Peers<N, E>>,
     ledger: LedgerReader<N>,
+    ledger_router: LedgerRouter<N>,
     operator: Arc<Operator<N, E>>,
     prover_router: ProverRouter<N>,
     memory_pool: Arc<RwLock<MemoryPool<N>>>,
 ) -> tokio::task::JoinHandle<()> {
     let credentials = RpcCredentials { username, password };
-    let rpc = RpcImpl::new(credentials, address, peers.clone(), ledger, operator, prover_router, memory_pool);
+    let rpc = RpcImpl::new(credentials, address, peers.clone(), ledger, ledger_router, operator, prover_router, memory_pool);
 
     let service = make_service_fn(move |conn: &AddrStream| {
         let caller = conn.remote_addr();
@@ -329,6 +334,20 @@ async fn handle_rpc<N: Network, E: Environment>(
         "sendtransaction" => {
             let result = rpc
                 .send_transaction(params[0].as_str().unwrap_or("").into())
+                .await
+                .map_err(convert_crate_err);
+            result_to_response(&req, result)
+        }
+        "password_connectpeer" => {
+            let result = rpc
+                .connect_peer(params[0].as_str().unwrap_or("").into())
+                .await
+                .map_err(convert_crate_err);
+            result_to_response(&req, result)
+        }
+        "password_setcoinbasepath" => {
+            let result = rpc
+                .set_coinbase_path(params[0].as_str().unwrap_or("").into())
                 .await
                 .map_err(convert_crate_err);
             result_to_response(&req, result)
